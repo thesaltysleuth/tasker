@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"encoding/json"
 	"time"
+	"errors"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -14,6 +15,13 @@ const queueKey = "tasker_queue"
 
 type Queue struct {
 	rdb *redis.Client
+}
+
+type jobPayload struct {
+	ID 				string 					`json:"id"`
+	Name 			string 					`json:"name"`
+	Args 			map[string]any	`json:"args"`
+	Attempts	int 						`json:"attempts"`
 }
 
 func New(addr, password string, db int) *Queue {
@@ -36,10 +44,8 @@ func (q *Queue) Ping(ctx context.Context) error {
 func (q *Queue) EnqueueTask(ctx context.Context, name string, args map[string]any) (string, error) {
 
 	id := uuid.NewString()
-	payload, _ := json.Marshal(map[string]any{
-		"id": id,
-		"name": name,
-		"args": args,
+	payload, _ := json.Marshal(jobPayload{
+		ID: id, Name: name, Args: args, Attempts: 3,
 	})
 	if err := q.rdb.LPush(ctx, queueKey, payload).Err(); err!=nil{
 		return "",err
@@ -66,11 +72,8 @@ func (q *Queue) loop(ctx context.Context, id int) {
 			time.Sleep(time.Second)
 			continue
 		}
-		var job struct {
-			ID 		string		`json:"id"`
-			Name	string		`json:"name"`
-			Args  map[string]any	`json:"args"`
-		}
+		var job jobPayload
+
 		if err := json.Unmarshal([]byte(res[1]), &job); err != nil{
 			fmt.Println("bad json:", err)
 			continue
@@ -81,8 +84,18 @@ func (q *Queue) loop(ctx context.Context, id int) {
 			fmt.Println("no handler for", job.Name)
 			continue
 		}
-		if err := h(ctx, job.Args); err != nil {
-			fmt.Printf("[worker %d] job %s error: %v\n", id, job.ID, err)
+		err = h(ctx, job.Args) 
+		if err != nil {
+			if errors.Is(err, ErrRetry) && job.Attempts > 0 {
+				job.Attempts--
+				raw, _ := json.Marshal(job)
+				// Requeue with small delay
+				time.Sleep(time.Second)
+				_ = q.rdb.LPush(ctx, queueKey, raw).Err()
+				fmt.Printf("[worker %d] jobs %s retry (%d left)\n", id, job.ID, job.Attempts)
+			} else {
+				fmt.Printf("[worker %d] job %s error: %v\n", id, job.ID, err)
+			}
 		}
 	}
 }
